@@ -11,6 +11,7 @@ import torch_directml
 
 # --- Load Dataset ---
 df = pd.read_csv('C:/Users/Bianco Blanco/Downloads/bank.csv', sep=";")
+
 # --- Exploratory Data Analysis (EDA) ---
 # Basic info and statistics
 print(df.info())
@@ -67,7 +68,7 @@ tail skew, however the data fits more of anormal curve with a clear peak around 
 
 Distribution of day is rather sporadic and does not resemble a normal curve at all.
 
-Distribuution of duration is heavily left tail skewed with a non-modal curve. However, this might be best explained by the fact
+Distribution of duration is heavily left tail skewed with a non-modal curve. However, this might be best explained by the fact
 that as marketers they want to keep this distribution as close to 0.
 
 Distribution of campaign is heafvily left tail skewed with a non-modal curve. However, this might be best explained by the fact
@@ -100,7 +101,6 @@ try:
 # If not Apple Silicon, catch and try AMD GPU on Windows via DirectML
 except ImportError:
     try:
-        import torch_directml
         dml = torch_directml.device()
         device = torch.device(dml)
         print("Using DirectML device:", device)
@@ -119,7 +119,6 @@ df = pd.read_csv('C:/Users/Bianco Blanco/Downloads/bank-full.csv', sep=";")
 
 target_col = 'y'
 
-# --- Prepare Data for Bayesian Neural Network (BNN) ---
 # Separate target and features
 y_series = df[target_col]
 features_df = df.drop(columns=[target_col])
@@ -132,6 +131,7 @@ features_df = pd.get_dummies(features_df, drop_first=True)
 
 # Convert all columns to numeric, coercing errors
 features_df = features_df.apply(lambda col: pd.to_numeric(col, errors='coerce'))
+
 # Fill any remaining NaNs
 features_df = features_df.fillna(features_df.mean())
 
@@ -142,12 +142,14 @@ print(features_df.dtypes)
 # Force numpy array to float32 to avoid object dtype
 features_array = features_df.values.astype(np.float32)
 print('Converted feature array dtype:', features_array.dtype)
+
 # Create tensor
 X = torch.from_numpy(features_array)
 
 y_array = (y_series.astype('category').cat.codes.values 
            if y_series.dtype == object or pd.api.types.is_categorical_dtype(y_series) 
            else y_series.values)
+
 # Convert target to float tensor
 y = torch.tensor(y_array.astype(np.float32)).unsqueeze(1)
 
