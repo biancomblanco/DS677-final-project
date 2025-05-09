@@ -6,7 +6,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import TensorDataset, DataLoader
-from torch.distributions import Normal
+from torch.distributions import Normal, Bernoulli
+from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import train_test_split 
+from sklearn.metrics import roc_curve, auc
 import torch_directml
 
 # --- Load Dataset ---
@@ -120,7 +123,7 @@ df = pd.read_csv('C:/Users/Bianco Blanco/Downloads/bank-full.csv', sep=";")
 target_col = 'y'
 
 # Separate target and features
-y_series = df[target_col]
+y_series = df[target_col].map({'no': 0, 'yes': 1}).astype(np.float32)
 features_df = df.drop(columns=[target_col])
 
 # Handle missing values in features
@@ -143,19 +146,29 @@ print(features_df.dtypes)
 features_array = features_df.values.astype(np.float32)
 print('Converted feature array dtype:', features_array.dtype)
 
-# Create tensor
-X = torch.from_numpy(features_array)
 
-y_array = (y_series.astype('category').cat.codes.values 
-           if y_series.dtype == object or pd.api.types.is_categorical_dtype(y_series) 
-           else y_series.values)
+# --- Standardize features ---
+scaler = StandardScaler()
+features_array = scaler.fit_transform(features_array).astype(np.float32)
 
-# Convert target to float tensor
-y = torch.tensor(y_array.astype(np.float32)).unsqueeze(1)
+# --- split train/validation ---
+X_train_np, X_val_np, y_train_np, y_val_np = train_test_split(
+    features_array, y_series.values, test_size=0.1, random_state=42
+)
+
+# Create tensors
+X_train = torch.from_numpy(X_train_np)
+y_train = torch.tensor(y_train_np).unsqueeze(1)  
+X_val   = torch.from_numpy(X_val_np)
+y_val   = torch.tensor(y_val_np).unsqueeze(1)
 
 # DataLoader setup
-dataset = TensorDataset(X, y)
-loader = DataLoader(dataset, batch_size=64, shuffle=True)
+train_dataset = TensorDataset(X_train, y_train)
+train_loader  = DataLoader(train_dataset, batch_size=64, shuffle=True)
+num_batches   = len(train_loader)               # for KL scaling
+
+val_dataset   = TensorDataset(X_val, y_val)    
+val_loader    = DataLoader(val_dataset, batch_size=64)  
 
 # --- Define Bayesian Linear Layer using pure torch ---
 class BayesianLinear(nn.Module):
@@ -189,22 +202,88 @@ class BayesianNN(nn.Module):
         return self.blinear2(x)
 
 # --- Training Loop (Bayes by Backprop) ---
-model = BayesianNN(in_features=X.shape[1])
-optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
+model = BayesianNN(in_features=X_train.shape[1])
+optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
 num_epochs = 1000
 
 for epoch in range(1, num_epochs + 1):
     epoch_loss = 0.0
-    for xb, yb in loader:
+    model.train()
+    for xb, yb in train_loader:
         optimizer.zero_grad()
         preds = model(xb)
-        likelihood = Normal(preds, 1.0)
+
+        log_prior  = model.blinear1.log_prior   + model.blinear2.log_prior
+        log_varpos = model.blinear1.log_variational_posterior \
+                   + model.blinear2.log_variational_posterior
+        kl = (log_varpos - log_prior) / num_batches
+
+        likelihood = Bernoulli(logits=preds)
         log_likelihood = likelihood.log_prob(yb).sum()
-        log_prior = model.blinear1.log_prior + model.blinear2.log_prior
-        log_posterior = model.blinear1.log_variational_posterior + model.blinear2.log_variational_posterior
-        loss = (log_posterior - log_prior) - log_likelihood
+
+        loss = kl - log_likelihood
         loss.backward()
         optimizer.step()
         epoch_loss += loss.item()
+
     if epoch % 100 == 0:
-        print(f"Epoch {epoch}\tLoss: {epoch_loss:.2f}")
+        avg_batch_loss = epoch_loss / num_batches
+
+        # training accuracy
+        model.eval()
+        correct, total = 0, 0
+        with torch.no_grad():
+            for xb, yb in train_loader:
+                preds = (torch.sigmoid(model(xb)) > 0.5).float()
+                correct += (preds == yb).sum().item()
+                total += yb.numel()
+        train_acc = correct / total
+
+        # validation accuracy
+        correct, total = 0, 0
+        with torch.no_grad():
+            for xb, yb in val_loader:
+                preds = (torch.sigmoid(model(xb)) > 0.5).float()
+                correct += (preds == yb).sum().item()
+                total += yb.numel()
+        val_acc = correct / total
+
+        print(f"Epoch {epoch:4d}  Avg Loss: {avg_batch_loss:.2f}  Train Acc: {train_acc:.4f}  Val Acc: {val_acc:.4f}")
+        print('-'*40)
+
+# --- plot ROC curve on validation set ---
+model.eval()
+val_probs, val_targets = [], []
+with torch.no_grad():
+    for xb, yb in val_loader:
+        p = torch.sigmoid(model(xb)).cpu().numpy().flatten()
+        val_probs.extend(p.tolist())
+        val_targets.extend(yb.cpu().numpy().flatten().tolist())
+
+fpr, tpr, _ = roc_curve(val_targets, val_probs)
+roc_auc = auc(fpr, tpr)
+
+plt.figure()
+plt.plot(fpr, tpr, label=f"ROC (AUC = {roc_auc:.3f})")
+plt.plot([0,1], [0,1], 'k--', label="Chance")
+plt.xlabel("False Positive Rate")
+plt.ylabel("True Positive Rate")
+plt.title("Validation ROC Curve")
+plt.legend(loc="lower right")
+plt.show()
+
+# --- Monte Carlo predictive uncertainty (after training) ---
+model.eval()
+T = 100  # number of MC samples
+mc_samples = []
+with torch.no_grad():
+    for _ in range(T):
+        batch_probs = []
+        for xb, _ in val_loader:
+            probs = torch.sigmoid(model(xb))
+            batch_probs.append(probs.cpu().numpy())
+        mc_samples.append(np.concatenate(batch_probs, axis=0))
+mc_mean = np.mean(mc_samples, axis=0)
+mc_std  = np.std(mc_samples,  axis=0)
+print("MC predictive uncertainty (std) mean:", mc_std.mean())
+print("MC predictive uncertainty (std) max:",  mc_std.max())
