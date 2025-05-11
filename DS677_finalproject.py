@@ -402,15 +402,6 @@ print(fn.drop_duplicates().head())
 # Attach the raw predicted probabilities in order to calculate ROC/calibration
 val_df['pred_prob'] = mc_mean
 
-# Martial status bias analysis
-female_mask = val_df['marital'] == 'married'
-female_probs = val_df.loc[female_mask, 'pred_prob']
-female_labels = val_df.loc[female_mask, 'true']
-female_auc = roc_auc_score(female_labels, female_probs)
-
-print("@"*120)
-print(f"\nAUC on married subset: {female_auc:.4f} (Drop: {bnn_auc - female_auc:.4f})")
-
 # --- Calibration curve (reliability diagram) ---
 
 # Use the true labels and the raw probabilities
