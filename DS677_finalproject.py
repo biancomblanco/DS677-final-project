@@ -8,8 +8,9 @@ import torch.nn.functional as F
 from torch.utils.data import TensorDataset, DataLoader
 from torch.distributions import Normal, Bernoulli
 from sklearn.preprocessing import StandardScaler
-from sklearn.model_selection import train_test_split 
-from sklearn.metrics import roc_curve, auc
+from sklearn.model_selection import train_test_split
+from sklearn.calibration import calibration_curve 
+from sklearn.metrics import roc_curve, auc, accuracy_score, roc_auc_score
 import torch_directml
 
 # --- Load Dataset ---
@@ -17,13 +18,23 @@ df = pd.read_csv('C:/Users/Bianco Blanco/Downloads/bank.csv', sep=";")
 
 # --- Exploratory Data Analysis (EDA) ---
 # Basic info and statistics
+print("Dataframe Info")
 print(df.info())
+
+print("-"*120)
+
+print("Summary Statistics")
 print(df.describe())
 
-# Missing values per column
-print("Missing values by column:\n", df.isnull().sum())
+print("-"*120)
 
-'''
+# Missing values per column
+print("Missing values by column:\n", df.isnull().sum()) 
+
+print("~"*120)
+
+print("Distribution plots, pairs plots, and heatmap")
+
 # Distribution plots for numeric features
 numeric_cols = df.select_dtypes(include=['float64', 'int64']).columns
 for col in numeric_cols:
@@ -46,9 +57,13 @@ sns.heatmap(corr, annot=True, fmt='.2f', cmap='coolwarm')
 plt.title('Feature Correlation Matrix')
 plt.show()
 
+
+print("~"*120)
+print("Interquantile EDA")
 Q1 = df['balance'].quantile(0.25)
 Q3 = df['balance'].quantile(0.75)
 IQR = Q3 - Q1
+
 
 # Keep rows within 1.5 * IQR
 df_filtered = df[(df['balance'] >= Q1 - 1.5 * IQR) & (df['balance'] <= Q3 + 1.5 * IQR)]
@@ -60,6 +75,27 @@ plt.title('Filtered Distribution of Balance (Outliers Removed)')
 plt.xlabel('Balance')
 plt.ylabel('Frequency')
 plt.show()
+
+'''
+print("="*120)
+print("Create Mosaic chart")
+# Mosaic chart for these variables
+cols = ['age','balance','duration','campaign','pdays','previous']
+fig, axes = plt.subplots(2, 3, figsize=(10, 6))
+
+for ax, col in zip(axes.flatten(), cols):
+    sns.histplot(df[col].dropna(), kde=True,
+                 ax=ax, bins=40, element='step')
+    ax.set_title(col)
+    ax.set_xlabel('')
+    if col in ['balance', 'duration', 'pdays', 'previous']:
+        ax.set_yscale('log')         
+        ax.set_ylabel('log‐count')
+    else:
+        ax.set_ylabel('count')
+
+plt.tight_layout()
+plt.savefig('dist_mosaic.pdf')      
 
 Distrubtion of Numeric Fetures breakdown:
 
@@ -93,6 +129,8 @@ Looking at the feature correlation matrix it follows the same pattern.
 
 '''
 
+print("="*120)
+print("Set GPU device")
 # --- Device Setup ---
 # First, attempt to use Apple Silicon (MPS) if available.
 try:
@@ -116,7 +154,12 @@ except ImportError:
             device = torch.device('cpu')
             print("Using CPU")
 
+print("="*120)
+print("Load in full dataset")
 df = pd.read_csv('C:/Users/Bianco Blanco/Downloads/bank-full.csv', sep=";")
+
+# keep track of the original row indices
+all_indices = df.index.to_numpy()
 
 # --- Prepare Data for Bayesian Neural Network (BNN) ---
 
@@ -138,27 +181,37 @@ features_df = features_df.apply(lambda col: pd.to_numeric(col, errors='coerce'))
 # Fill any remaining NaNs
 features_df = features_df.fillna(features_df.mean())
 
+print("+"*120)
+
 # Diagnostic: print dtypes
 print('Feature column dtypes after conversion:')
 print(features_df.dtypes)
 
-# Force numpy array to float32 to avoid object dtype
+# Force numpy array to float32 for error handaling
 features_array = features_df.values.astype(np.float32)
 print('Converted feature array dtype:', features_array.dtype)
 
+print("+"*120)
 
-# --- Standardize features ---
-scaler = StandardScaler()
-features_array = scaler.fit_transform(features_array).astype(np.float32)
-
-# --- split train/validation ---
-X_train_np, X_val_np, y_train_np, y_val_np = train_test_split(
-    features_array, y_series.values, test_size=0.1, random_state=42
+# --- split train/validation  ---
+X_train_np, X_val_np, y_train_np, y_val_np, idx_train, idx_val = train_test_split(
+    features_array, y_series.values, all_indices,
+    test_size=0.1,
+    stratify=y_series,
+    random_state=42
 )
 
-# Create tensors
+# --- Standardize features  ---
+scaler = StandardScaler()
+X_train_np = scaler.fit_transform(X_train_np).astype(np.float32)
+X_val_np   = scaler.transform(X_val_np).astype(np.float32)
+
+# --- Print number of features (input dimensions) ---
+print(f"Number of input features: {X_train_np.shape[1]}")
+
+# Convert to tensors
 X_train = torch.from_numpy(X_train_np)
-y_train = torch.tensor(y_train_np).unsqueeze(1)  
+y_train = torch.tensor(y_train_np).unsqueeze(1)
 X_val   = torch.from_numpy(X_val_np)
 y_val   = torch.tensor(y_val_np).unsqueeze(1)
 
@@ -206,6 +259,8 @@ model = BayesianNN(in_features=X_train.shape[1])
 optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
 num_epochs = 1000
 
+print("*"*120)
+print("Begin BNN Training")
 for epoch in range(1, num_epochs + 1):
     epoch_loss = 0.0
     model.train()
@@ -263,6 +318,10 @@ with torch.no_grad():
 fpr, tpr, _ = roc_curve(val_targets, val_probs)
 roc_auc = auc(fpr, tpr)
 
+bnn_train_acc = train_acc
+bnn_val_acc = val_acc
+bnn_auc = roc_auc
+
 plt.figure()
 plt.plot(fpr, tpr, label=f"ROC (AUC = {roc_auc:.3f})")
 plt.plot([0,1], [0,1], 'k--', label="Chance")
@@ -272,10 +331,14 @@ plt.title("Validation ROC Curve")
 plt.legend(loc="lower right")
 plt.show()
 
+print("*"*120)
+print("Monte Carlo uncertainty prediction")
+
 # --- Monte Carlo predictive uncertainty (after training) ---
 model.eval()
 T = 100  # number of MC samples
 mc_samples = []
+
 with torch.no_grad():
     for _ in range(T):
         batch_probs = []
@@ -285,5 +348,172 @@ with torch.no_grad():
         mc_samples.append(np.concatenate(batch_probs, axis=0))
 mc_mean = np.mean(mc_samples, axis=0)
 mc_std  = np.std(mc_samples,  axis=0)
+
+print("&"*120)
 print("MC predictive uncertainty (std) mean:", mc_std.mean())
 print("MC predictive uncertainty (std) max:",  mc_std.max())
+
+# Convert target list to a flat array
+val_targets = np.array(val_targets).flatten()  
+
+# Error handle Flatten mc_std 
+mc_std = mc_std.flatten()
+
+# Compute the 10%‐rejection threshold
+threshold = np.percentile(mc_std, 90)
+
+# Build a 1D boolean mask
+keep_mask = mc_std <= threshold               
+
+# Apply mask to both probs and targets
+selected_probs = mc_mean[keep_mask]
+selected_true  = val_targets[keep_mask]
+selected_pred  = (selected_probs > 0.5).astype(int)
+
+# Compute metrics
+sel_acc = accuracy_score(selected_true, selected_pred)
+sel_auc = roc_auc_score(selected_true, selected_probs)
+
+print("&"*120)
+print(f"Selective Prediction -> Acc: {sel_acc:.3f}, AUC: {sel_auc:.3f}")
+
+# --- align the raw DataFrame to val set using idx_val ---
+val_df = df.loc[idx_val].copy()     
+val_df['true'] = y_val_np            
+val_df['pred'] = (mc_mean > 0.5).astype(int)  
+
+# compute FPs and FNs
+fp = val_df[(val_df['pred'] == 1) & (val_df['true'] == 0)]
+fn = val_df[(val_df['pred'] == 0) & (val_df['true'] == 1)]
+
+fp_rate = len(fp) / len(val_df)
+fn_rate = len(fn) / len(val_df)
+
+print("@"*120)
+print(f"\nFalse Positives: {len(fp)} ({fp_rate:.2%})")
+print("Example False Positives:")
+print(fp.drop_duplicates().head())
+
+print(f"\nFalse Negatives: {len(fn)} ({fn_rate:.2%})")
+print("Example False Negatives:")
+print(fn.drop_duplicates().head()) 
+
+
+# Attach the raw predicted probabilities in order to calculate ROC/calibration
+val_df['pred_prob'] = mc_mean
+
+# Martial status bias analysis
+female_mask = val_df['marital'] == 'married'
+female_probs = val_df.loc[female_mask, 'pred_prob']
+female_labels = val_df.loc[female_mask, 'true']
+female_auc = roc_auc_score(female_labels, female_probs)
+
+print("@"*120)
+print(f"\nAUC on married subset: {female_auc:.4f} (Drop: {bnn_auc - female_auc:.4f})")
+
+# --- Calibration curve (reliability diagram) ---
+
+# Use the true labels and the raw probabilities
+prob_true, prob_pred = calibration_curve(
+    val_df['true'],
+    val_df['pred_prob'],
+    n_bins=10,
+    strategy='uniform'
+)
+
+plt.figure(figsize=(6,6))
+plt.plot(prob_pred, prob_true, marker='o', label='BNN')
+plt.plot([0,1],[0,1],'k--', label='Perfectly calibrated')
+plt.xlabel("Mean predicted probability")
+plt.ylabel("Fraction of positives")
+plt.title("Reliability Diagram (BNN)")
+plt.legend()
+plt.grid(True)
+plt.show()
+
+# -- Define LogisticRegression to compare to BNN-- #
+class LogisticRegression(nn.Module):
+    def __init__(self, input_dim):
+        super().__init__()
+        self.linear = nn.Linear(input_dim, 1)
+
+    def forward(self, x):
+        return torch.sigmoid(self.linear(x))
+
+# -- Define NeuralNetwork to compare to BNN -- #    
+class StandardNN(nn.Module):
+    def __init__(self, input_dim, hidden_dim=50):
+        super().__init__()
+        self.fc1 = nn.Linear(input_dim, hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, 1)
+
+    def forward(self, x):
+        x = torch.relu(self.fc1(x))
+        return torch.sigmoid(self.fc2(x))    
+
+# -- Define shared training loop for LogisticRegression and NeuralNetwork -- #    
+def train_model(model, train_loader, val_loader, device, epochs=1000, lr=0.001, model_name="Model"):
+    print(f"\nTraining {model_name} \n" + "="*50)
+
+    model = model.to(device)
+    criterion = nn.BCELoss()
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+
+    for epoch in range(1, epochs + 1):
+        model.train()
+        for xb, yb in train_loader:
+            xb, yb = xb.to(device), yb.to(device)
+            optimizer.zero_grad()
+            loss = criterion(model(xb), yb)
+            loss.backward()
+            optimizer.step()
+
+        if epoch % 100 == 0:
+            # --- Evaluate on Training Set ---
+            model.eval()
+            train_true, train_pred = [], []
+            with torch.no_grad():
+                for xb, yb in train_loader:
+                    xb = xb.to(device)
+                    preds = model(xb).cpu()
+                    train_pred.extend((preds > 0.5).float().numpy().flatten())
+                    train_true.extend(yb.numpy().flatten())
+            train_acc = accuracy_score(train_true, train_pred)
+
+            # --- Evaluate on Validation Set ---
+            val_true, val_pred, val_scores = [], [], []
+            with torch.no_grad():
+                for xb, yb in val_loader:
+                    xb = xb.to(device)
+                    preds = model(xb).cpu()
+                    val_scores.extend(preds.numpy().flatten())
+                    val_pred.extend((preds > 0.5).float().numpy().flatten())
+                    val_true.extend(yb.numpy().flatten())
+            val_acc = accuracy_score(val_true, val_pred)
+            val_auc = roc_auc_score(val_true, val_scores)
+
+            print(f"Epoch {epoch:4d}  Train Acc: {train_acc:.4f}  Val Acc: {val_acc:.4f}  AUC: {val_auc:.4f}")
+            print('-' * 50)
+
+    return train_acc, val_acc, val_auc
+
+# Instantiate and train both models
+logistic_model = LogisticRegression(X_train.shape[1])
+nn_model = StandardNN(X_train.shape[1], hidden_dim=50)
+
+logistic_train_acc, logistic_val_acc, logistic_auc = train_model(
+    logistic_model, train_loader, val_loader, device, model_name="Logistic Regression")
+
+nn_train_acc, nn_val_acc, nn_auc = train_model(
+    nn_model, train_loader, val_loader, device, model_name="Standard Neural Network")
+
+
+results = pd.DataFrame({
+    "Model": ["Logistic Regression", "Standard Neural Network", "Bayesian Neural Network"],
+    "Train Accuracy": [logistic_train_acc, nn_train_acc, bnn_train_acc],
+    "Validation Accuracy": [logistic_val_acc, nn_val_acc, bnn_val_acc],
+    "Validation AUC": [logistic_auc, nn_auc, bnn_auc]
+})
+
+print("\nFinal Comparison of Models:\n")
+print(results.to_string(index=False))
